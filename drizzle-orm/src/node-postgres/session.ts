@@ -108,12 +108,25 @@ export class NodePgSession<
 		// pg-pool detaches its own `error` listener from checked-out clients, so a connection dropped mid-transaction would crash the process
 		let connectionError: Error | undefined;
 		let rollbackError: Error | undefined;
+		let released = false;
+
+		let rejectConnection: ((err: Error) => void) | undefined;
+		const connectionErrorPromise = poolClient
+			? new Promise<never>((_, reject) => {
+				rejectConnection = reject;
+			})
+			: undefined;
+		// Prevent unhandled rejection if transaction succeeds before any connection error
+		connectionErrorPromise?.catch(() => {});
+
 		const onConnectionError = (e: Error) => {
 			connectionError ??= e;
+			rejectConnection?.(e);
 		};
 		poolClient?.on('error', onConnectionError);
 		const release = () => {
-			if (!poolClient) return;
+			if (!poolClient || released) return;
+			released = true;
 			// broken client is destroyed by the pool, listener stays to absorb any trailing errors
 			if (!connectionError) poolClient.off('error', onConnectionError);
 			poolClient.release(connectionError ?? rollbackError);
@@ -145,7 +158,12 @@ export class NodePgSession<
 			if (typeof config?.snapshot === 'string') {
 				await tx.execute(tx.setTransactionSnapshotSQL(config.snapshot));
 			}
-			const result = await transaction(tx);
+			const txPromise = transaction(tx);
+			// Absorb any late unhandled rejection from the abandoned callback if connection drops first
+			txPromise.catch(() => {});
+			const result = connectionErrorPromise
+				? await Promise.race([txPromise, connectionErrorPromise])
+				: await txPromise;
 			await tx.execute(sql`commit`);
 			return result;
 		} catch (error) {
